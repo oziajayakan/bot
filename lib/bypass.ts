@@ -20,14 +20,7 @@ export interface LinkLog {
   timestamp: string;
 }
 
-// =============================================
-// Safelink Bypass Engine v2
-// Handles 403/bot-detection dengan multi-step:
-//  1. Kunjungi homepage domain dulu (dapat cookie)
-//  2. Baru fetch halaman safelink dengan cookie + referer
-// =============================================
-
-// Beberapa User-Agent acak agar tidak selalu sama
+// User-Agent rotation
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
@@ -44,9 +37,8 @@ function buildHeaders(referer?: string, cookies?: string): Record<string, string
   const ua = randomUA();
   const headers: Record<string, string> = {
     'User-Agent': ua,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
     'Sec-Fetch-Dest': 'document',
@@ -62,25 +54,22 @@ function buildHeaders(referer?: string, cookies?: string): Record<string, string
 }
 
 /**
- * Ambil cookie dari homepage domain sebelum fetch safelink.
- * Ini meniru perilaku browser yang mengunjungi site dari awal.
+ * Fetch a URL with automatic cookie grabbing and multi-step / retry handling
  */
-async function fetchWithCookies(targetUrl: string): Promise<{ html: string; finalUrl: string }> {
+async function fetchPage(targetUrl: string, referer?: string): Promise<{ html: string; finalUrl: string; cookies: string }> {
   const parsed = new URL(targetUrl);
   const origin = `${parsed.protocol}//${parsed.hostname}`;
 
   let cookies = '';
 
-  // Step 1: Kunjungi homepage dulu untuk dapat cookie sesi
+  // Step 1: Pre-fetch homepage for cookies if no cookies yet
   try {
     const homeRes = await fetch(origin, {
       headers: buildHeaders(undefined, undefined),
       redirect: 'follow',
     });
-    // Extract Set-Cookie header
     const setCookie = homeRes.headers.get('set-cookie');
     if (setCookie) {
-      // Parse multiple cookies menjadi satu string "key=val; key2=val2"
       cookies = setCookie
         .split(',')
         .map((c) => c.split(';')[0].trim())
@@ -88,34 +77,39 @@ async function fetchWithCookies(targetUrl: string): Promise<{ html: string; fina
         .join('; ');
     }
   } catch {
-    // Abaikan jika homepage gagal, tetap lanjut ke halaman target
+    // Continue if homepage fails
   }
 
-  // Step 2: Fetch halaman safelink dengan cookie + referer
-  const res = await fetch(targetUrl, {
-    headers: buildHeaders(origin + '/', cookies || undefined),
+  // Step 2: Fetch target URL
+  let res = await fetch(targetUrl, {
+    headers: buildHeaders(referer || origin + '/', cookies || undefined),
     redirect: 'follow',
   });
 
-  // Jika masih 403, coba tanpa cookie sama sekali tapi dengan referer Google
+  // Retry with Google referer if 403
   if (res.status === 403) {
-    const retryRes = await fetch(targetUrl, {
+    res = await fetch(targetUrl, {
       headers: buildHeaders('https://www.google.com/', undefined),
       redirect: 'follow',
     });
-    if (!retryRes.ok) {
-      throw new Error(`HTTP ${retryRes.status} when fetching safelink (after retry with Google referer)`);
-    }
-    const html = await retryRes.text();
-    return { html, finalUrl: retryRes.url };
   }
 
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} when fetching safelink`);
   }
 
+  const finalSetCookie = res.headers.get('set-cookie');
+  if (finalSetCookie) {
+    const newCookies = finalSetCookie
+      .split(',')
+      .map((c) => c.split(';')[0].trim())
+      .filter(Boolean)
+      .join('; ');
+    cookies = cookies ? `${cookies}; ${newCookies}` : newCookies;
+  }
+
   const html = await res.text();
-  return { html, finalUrl: res.url };
+  return { html, finalUrl: res.url, cookies };
 }
 
 /**
@@ -123,7 +117,53 @@ async function fetchWithCookies(targetUrl: string): Promise<{ html: string; fina
  * Returns the destination URL string or throws an error.
  */
 export async function bypassSafelink(url: string): Promise<string> {
-  const { html, finalUrl } = await fetchWithCookies(url);
+  const { html, finalUrl, cookies } = await fetchPage(url);
+
+  // Special Handler: Auto-submit form (e.g. sfl.gl, safelinku, etc.)
+  // Patterns like: <form action="https://app.khaddavi.net/redirect.php" id="form" method="GET">
+  const formMatch = html.match(/<form[^>]+action=["']([^"']+)["'][^>]*>([\s\S]*?)<\/form>/i);
+  if (formMatch) {
+    const formAction = formMatch[1];
+    const formBody = formMatch[2];
+    const isAutoSubmit =
+      html.includes('.submit()') ||
+      html.includes('DOMContentLoaded') ||
+      formBody.includes('ray_id') ||
+      formBody.includes('alias');
+
+    if (isAutoSubmit && formAction.startsWith('http')) {
+      // Parse inputs from form
+      const inputs = [...formBody.matchAll(/<input[^>]+name=["']([^"']+)["'][^>]+value=["']([^"']*)["']/gi)];
+      const targetUrl = new URL(formAction);
+      for (const input of inputs) {
+        targetUrl.searchParams.set(input[1], input[2]);
+      }
+
+      // Execute GET submission
+      try {
+        const redirectRes = await fetch(targetUrl.toString(), {
+          headers: buildHeaders(url, cookies || undefined),
+          redirect: 'manual',
+        });
+
+        const locationHeader = redirectRes.headers.get('location');
+        if (locationHeader) {
+          const resolvedLocation = new URL(locationHeader, targetUrl).toString();
+          return resolvedLocation;
+        }
+
+        // If it followed redirect automatically or 200
+        if (redirectRes.url && redirectRes.url !== targetUrl.toString()) {
+          return redirectRes.url;
+        }
+
+        return targetUrl.toString();
+      } catch {
+        // Fallback to targetUrl string if network fails
+        return targetUrl.toString();
+      }
+    }
+  }
 
   // Strategy 1: window.location redirect
   const windowLocMatch = html.match(/window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
@@ -149,9 +189,10 @@ export async function bypassSafelink(url: string): Promise<string> {
     if (val.startsWith('http')) return val;
   }
 
-  // Strategy 5: URL di dalam atribut action form
-  const formActionMatch = html.match(/<form[^>]+action=["']([^"']+)["']/i);
-  if (formActionMatch && formActionMatch[1].startsWith('http')) return formActionMatch[1];
+  // Strategy 5: URL di dalam atribut action form standard
+  if (formMatch && formMatch[1].startsWith('http')) {
+    return formMatch[1];
+  }
 
   // Strategy 6: Common safelink GET param (?url= / ?link= / ?go= / ?ref=)
   const urlParam = new URL(finalUrl);
@@ -184,8 +225,7 @@ export async function bypassSafelink(url: string): Promise<string> {
     const href = match[1];
     try {
       const hrefHost = new URL(href).hostname;
-      // Jika link mengarah ke domain berbeda, kemungkinan besar itu tujuan
-      if (hrefHost !== parsedOrigin && !href.includes('google') && !href.includes('facebook')) {
+      if (hrefHost !== parsedOrigin && !href.includes('google') && !href.includes('facebook') && !href.includes('twitter')) {
         return href;
       }
     } catch { /* skip */ }
@@ -201,6 +241,6 @@ export async function bypassSafelink(url: string): Promise<string> {
 
   throw new Error(
     'Tidak dapat mengekstrak URL tujuan dari halaman safelink ini. ' +
-    'Format safelink mungkin belum didukung atau menggunakan JavaScript dinamis.'
+    'Format safelink mungkin memerlukan interaksi manual.'
   );
 }
